@@ -5,3 +5,6 @@ numpy>=1.26
 pandas>=2.2
 Pillow>=10
 lapx>=0.5.5
+transformers>=4.44
+accelerate>=0.33
+einops>=0.8

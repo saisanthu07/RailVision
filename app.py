@@ -4,6 +4,7 @@ Minimalist Command-Center Interface
 Ministry of Railways · CRIS · Integrated CCTV Intelligence
 """
 import streamlit as st
+import threading
 import html as _html
 import cv2
 import numpy as np
@@ -492,6 +493,7 @@ for k, v in {
     "events": [], "total_alerts": 0, "last_alert": {},
     "history": [], "live": {"people": 0, "zone": 0, "risk": "—"},
     "snapshots": [], "stop_requested": False, "detection_warning": False,
+    "last_vlm_call": 0.0,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -541,6 +543,7 @@ with st.sidebar:
     mod_restricted = st.checkbox("Restricted zone",      True)
     mod_track      = st.checkbox("Track intrusion",      True)
     mod_abandoned  = st.checkbox("Abandoned objects",    True)
+    mod_behavior_ai = st.checkbox("AI Behavior Analysis (LLM)", True)
     mod_weapon     = st.checkbox("Weapon detection",     True)
     mod_staff      = st.checkbox("Staff post monitor",   True)
     st.divider()
@@ -583,6 +586,132 @@ def get_face_cascade():
         cc = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         return cc if not cc.empty() else None
     return None
+
+_vlm_lock = threading.Lock()
+
+@st.cache_resource(show_spinner="Loading behavior-analysis model…")
+def get_vlm():
+    """Load Moondream2 once per process. Shared read-only across sessions;
+    calls are serialized via _vlm_lock since transformers .generate() is not
+    safe to call concurrently on the same model instance from multiple threads."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
+    if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+        PreTrainedModel.all_tied_weights_keys = property(lambda self: {})
+    model_id = "vikhyatk/moondream2"
+    vlm = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(model_id)
+    return vlm, tok
+
+def describe_frame(frame_bgr, prompt):
+    """Run one captioning/VQA call against a cropped or full BGR frame.
+    Returns a short string description, or None on any failure (never raises)."""
+    try:
+        vlm, tok = get_vlm()
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        from PIL import Image
+        pil_img = Image.fromarray(rgb)
+        with _vlm_lock:
+            enc = vlm.encode_image(pil_img)
+            answer = vlm.answer_question(enc, prompt, tok)
+        return answer.strip()[:200] if answer else None
+    except Exception:
+        return None
+
+def scan_for_abnormal_behavior(frame_bgr):
+    """Ask the local VLM a general yes/no + description question about the whole frame.
+    Returns (is_abnormal: bool, description: str) or (False, None) on any failure/parse issue."""
+    raw = describe_frame(
+        frame_bgr,
+        "You are monitoring a railway station CCTV feed. Look for abnormal human behavior: "
+        "fighting, running, falling, aggressive gestures, or any unusual activity. "
+        "Respond in exactly this format: NORMAL or ABNORMAL: <one short sentence>."
+    )
+    if not raw:
+        return False, None
+    if raw.upper().startswith("ABNORMAL"):
+        desc = raw.split(":", 1)[1].strip() if ":" in raw else raw
+        return True, desc[:200]
+    return False, None
+
+def scan_for_fight(frame_bgr):
+    """Ask VLM whether persons in the frame are fighting or physically struggling.
+    Returns (is_fighting: bool, description: str) or (False, None) on failure."""
+    raw = describe_frame(
+        frame_bgr,
+        "You are a railway station security system. Are people fighting, physically "
+        "struggling, or striking each other in this image? "
+        "Respond in exactly this format: FIGHTING: <one short sentence> or NOT FIGHTING."
+    )
+    if not raw:
+        return False, None
+    if raw.upper().startswith("FIGHTING"):
+        desc = raw.split(":", 1)[1].strip() if ":" in raw else raw
+        return True, desc[:200]
+    return False, None
+
+def scan_for_pickpocket(frame_bgr):
+    """Ask VLM whether a pickpocketing or bag-snatching event is visible.
+    Returns (is_theft: bool, description: str) or (False, None) on failure."""
+    raw = describe_frame(
+        frame_bgr,
+        "You are a railway station security system. Is anyone grabbing, snatching, or "
+        "taking a bag, wallet, or item from another person in this image? "
+        "Respond in exactly this format: THEFT: <one short sentence> or NO THEFT."
+    )
+    if not raw:
+        return False, None
+    if raw.upper().startswith("THEFT"):
+        desc = raw.split(":", 1)[1].strip() if ":" in raw else raw
+        return True, desc[:200]
+    return False, None
+
+def scan_for_fallen_person(frame_bgr):
+    """Ask VLM whether a person has fallen or collapsed in the frame crop.
+    Returns (is_fallen: bool, description: str) or (False, None) on failure."""
+    raw = describe_frame(
+        frame_bgr,
+        "You are a railway station safety system. Is there a person who has fallen down "
+        "or collapsed on the ground in this image? "
+        "Respond in exactly this format: FALLEN: <one short sentence> or NOT FALLEN."
+    )
+    if not raw:
+        return False, None
+    if raw.upper().startswith("FALLEN"):
+        desc = raw.split(":", 1)[1].strip() if ":" in raw else raw
+        return True, desc[:200]
+    return False, None
+
+def scan_for_package_drop(crop_bgr):
+    """Ask VLM whether the cropped region shows a bag/package that was left unattended.
+    Returns (is_suspicious: bool, description: str) or (False, None) on failure."""
+    raw = describe_frame(
+        crop_bgr,
+        "You are a railway station security system. Is this a bag, luggage, or package "
+        "that appears to have been left unattended or dropped intentionally? "
+        "Respond in exactly this format: SUSPICIOUS: <one short sentence> or NOT SUSPICIOUS."
+    )
+    if not raw:
+        return False, None
+    if raw.upper().startswith("SUSPICIOUS"):
+        desc = raw.split(":", 1)[1].strip() if ":" in raw else raw
+        return True, desc[:200]
+    return False, None
+
+def scan_for_unattended_child(frame_bgr):
+    """Ask VLM whether a young child appears to be alone/unattended in the frame.
+    Returns (is_child_alone: bool, description: str) or (False, None) on failure."""
+    raw = describe_frame(
+        frame_bgr,
+        "You are a railway station safety system. Is there a young child (under ~12 years) "
+        "who appears to be alone without a parent or guardian nearby? "
+        "Respond in exactly this format: CHILD ALONE: <one short sentence> or NO CHILD ALONE."
+    )
+    if not raw:
+        return False, None
+    if raw.upper().startswith("CHILD ALONE") or raw.upper().startswith("CHILD_ALONE"):
+        desc = raw.split(":", 1)[1].strip() if ":" in raw else raw
+        return True, desc[:200]
+    return False, None
 
 try:
     model = _get_session_model(model_name)
@@ -787,6 +916,12 @@ def status_rows(rows):
     return f'<table class="rv-stbl">{inner}</table>'
 
 def alerts_html(events, n=10):
+    cat_colors = {
+        "CROWD":      "#0891b2",
+        "SECURITY":   "#dc2626",
+        "OPERATIONS": "#d97706",
+        "BEHAVIOR":   "#8a5fd6",
+    }
     sc = {"CRITICAL":"crit","HIGH":"high","MEDIUM":"med","LOW":"low"}
     rows = ""
     for e in events[:n]:
@@ -1024,6 +1159,16 @@ elif page == "Live Command Center":
 
         heat=deque(maxlen=10000); obj_tracks=defaultdict(lambda:{"first":0,"seen":0})
         trails=defaultdict(lambda:deque(maxlen=45))
+        dwell_start=defaultdict(lambda: None)   # tid -> frame_idx when this track was first seen stationary
+        prev_gray_frame = None
+        last_general_scan = 0.0
+        last_fight_scan   = 0.0
+        last_pick_scan    = 0.0
+        last_fall_scan    = 0.0
+        last_drop_scan    = 0.0
+        last_child_scan   = 0.0
+        prev_pcents       = []   # person centres from previous frame (for package-drop proximity check)
+        pkg_close_on_drop = {}   # obj tid -> bool: was a person nearby when the object first appeared?
         count_history=deque(maxlen=5)  # Temporal smoothing buffer
         frame_idx=0; staff_empty=0; t_prev=time.time()
         proc_fps=0.0; faces_total=0; person_count=0; zone_count=0; risk="—"
@@ -1042,6 +1187,13 @@ elif page == "Live Command Center":
             h0,w0=frame.shape[:2]
             if w0>1280: s=1280/w0; frame=cv2.resize(frame,(1280,int(h0*s)),interpolation=cv2.INTER_LINEAR)
             H,W=frame.shape[:2]
+
+            gray_now = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            motion_score = 0.0
+            if prev_gray_frame is not None and prev_gray_frame.shape == gray_now.shape:
+                diff = cv2.absdiff(gray_now, prev_gray_frame)
+                motion_score = float((diff > 30).sum()) / diff.size  # fraction of pixels that changed significantly
+            prev_gray_frame = gray_now
 
             crowd_zone=(int(W*0.05),HUD+int((H-HUD)*0.04),int(W*0.95),int(H*0.92))
             restr_zone=(int(W*0.02),HUD,int(W*0.28),HUD+int((H-HUD)*0.42))
@@ -1084,6 +1236,24 @@ elif page == "Live Command Center":
                             if len(tr)>1:
                                 pts=np.array(tr,dtype=np.int32).reshape(-1,1,2)
                                 cv2.polylines(frame,[pts],False,(50,150,70),1,cv2.LINE_AA)
+                        if mod_behavior_ai and tid is not None:
+                            tr_hist = trails.get(tid)
+                            if tr_hist and len(tr_hist) >= 10:
+                                pts = list(tr_hist)[-10:]
+                                disp = max(((px-pts[0][0])**2+(py-pts[0][1])**2)**0.5 for px,py in pts)
+                                if disp < 25:  # minimal movement over last 10 tracked positions
+                                    if dwell_start[tid] is None: dwell_start[tid] = frame_idx
+                                    dwell_sec = (frame_idx - dwell_start[tid]) / src_fps
+                                    if dwell_sec >= 25 and (time.time() - st.session_state["last_vlm_call"]) >= 8:
+                                        st.session_state["last_vlm_call"] = time.time()
+                                        desc = describe_frame(frame[max(0,y1):y2, max(0,x1):x2],
+                                                               "Describe this person's posture and behavior in one short sentence.")
+                                        detail = desc if desc else f"Person stationary for {dwell_sec:.0f}s"
+                                        highlight_zone(frame,(x1,y1,x2,y2),"PROLONGED LOITERING","MEDIUM")
+                                        s=snap(frame); add_event("BEHAVIOR","Prolonged Loitering","MEDIUM",cam_label,detail,s)
+                                        dwell_start[tid] = frame_idx  # reset so it doesn't refire every frame
+                                else:
+                                    dwell_start[tid] = None
                         if mod_privacy: faces_blurred+=blur_face(frame,x1,y1,x2,y2)
                         cv2.rectangle(frame,(x1,y1),(x2,y2),(0,165,70),1)
                         if tid is not None:
@@ -1132,6 +1302,139 @@ elif page == "Live Command Center":
             if mod_staff:      draw_zone(frame,staff_zone,"STAFF POST",(0,140,190))
             if mod_restricted: draw_zone(frame,restr_zone,"RESTRICTED",(150,0,0))
             if mod_track:      draw_zone(frame,track_zone,"TRACK ZONE",(0,0,150))
+
+            if mod_behavior_ai and len(pcents) >= 2 and (time.time() - st.session_state["last_vlm_call"]) >= 8:
+                close_pairs = []
+                for i in range(len(pcents)):
+                    for j in range(i+1, len(pcents)):
+                        d = ((pcents[i][0]-pcents[j][0])**2 + (pcents[i][1]-pcents[j][1])**2) ** 0.5
+                        if d < 60:
+                            close_pairs.append((i, j))
+                if not hasattr(describe_frame, "_prev_close_pairs"):
+                    describe_frame._prev_close_pairs = set()
+                prev = describe_frame._prev_close_pairs
+                curr = set(close_pairs)
+                separated = prev - curr
+                if separated:
+                    st.session_state["last_vlm_call"] = time.time()
+                    desc = describe_frame(frame, "Two people who were close together just separated. Describe what is visible in one short sentence, focusing on any bag, object, or hand movement.")
+                    detail = desc if desc else "Two persons in close proximity separated abruptly"
+                    highlight_zone(frame,(int(W*0.05),HUD,int(W*0.95),H-1),"BEHAVIOR ALERT — REVIEW ADVISED","MEDIUM")
+                    s=snap(frame); add_event("BEHAVIOR","Possible Unauthorized Item Removal — Needs Review","MEDIUM",cam_label,detail,s)
+                describe_frame._prev_close_pairs = curr
+
+            if mod_behavior_ai:
+                now = time.time()
+                cooldown_ok = (now - st.session_state["last_vlm_call"]) >= 8
+                motion_spike = motion_score > 0.02
+                periodic_due = (now - last_general_scan) >= 20
+                if cooldown_ok and (motion_spike or periodic_due):
+                    st.session_state["last_vlm_call"] = now
+                    last_general_scan = now
+                    is_abnormal, desc = scan_for_abnormal_behavior(frame)
+                    if is_abnormal:
+                        highlight_zone(frame,(int(W*0.05),HUD,int(W*0.95),H-1),"ABNORMAL BEHAVIOR DETECTED","HIGH")
+                        s=snap(frame); add_event("BEHAVIOR","Abnormal Behavior Detected","HIGH",cam_label,desc or "Unusual activity flagged by AI scan",s)
+
+            # ── Fighting heuristic ──────────────────────────────────────────
+            # Pre-filter: 2+ persons within 150px of each other AND motion spike
+            if mod_behavior_ai and len(pcents) >= 2 and motion_score > 0.01:
+                _fight_close = any(
+                    ((pcents[i][0]-pcents[j][0])**2+(pcents[i][1]-pcents[j][1])**2)**0.5 < 150
+                    for i in range(len(pcents)) for j in range(i+1, len(pcents))
+                )
+                if _fight_close:
+                    now_f = time.time()
+                    if (now_f - st.session_state["last_vlm_call"]) >= 8 and (now_f - last_fight_scan) >= 8:
+                        st.session_state["last_vlm_call"] = now_f; last_fight_scan = now_f
+                        is_f, desc = scan_for_fight(frame)
+                        if is_f:
+                            highlight_zone(frame,(int(W*0.05),HUD,int(W*0.95),H-1),"PHYSICAL ALTERCATION DETECTED","HIGH")
+                            s=snap(frame); add_event("BEHAVIOR","Fighting / Physical Altercation","HIGH",cam_label,desc or "Persons in close contact with high motion",s)
+
+            # ── Pickpocket / bag-snatch heuristic ───────────────────────────
+            # Pre-filter: 2+ persons within 150px AND moderate motion
+            if mod_behavior_ai and len(pcents) >= 2 and motion_score > 0.01:
+                _pick_close = any(
+                    ((pcents[i][0]-pcents[j][0])**2+(pcents[i][1]-pcents[j][1])**2)**0.5 < 150
+                    for i in range(len(pcents)) for j in range(i+1, len(pcents))
+                )
+                if _pick_close:
+                    now_p = time.time()
+                    if (now_p - st.session_state["last_vlm_call"]) >= 8 and (now_p - last_pick_scan) >= 8:
+                        st.session_state["last_vlm_call"] = now_p; last_pick_scan = now_p
+                        is_pk, desc = scan_for_pickpocket(frame)
+                        if is_pk:
+                            highlight_zone(frame,(int(W*0.05),HUD,int(W*0.95),H-1),"POSSIBLE THEFT — REVIEW ADVISED","HIGH")
+                            s=snap(frame); add_event("BEHAVIOR","Possible Pickpocketing / Bag-snatch — Needs Review","HIGH",cam_label,desc or "Close contact with suspected item movement",s)
+
+            # ── Fallen person heuristic ──────────────────────────────────────
+            # Pre-filter: any person bounding box is wider than tall (horizontal = collapsed)
+            if mod_behavior_ai:
+                _fallen = []
+                if result is not None and result.boxes is not None:
+                    for _b in result.boxes:
+                        if int(_b.cls[0]) != PERSON_CLS: continue
+                        _bx1,_by1,_bx2,_by2 = map(int, _b.xyxy[0].tolist())
+                        _bw,_bh = _bx2-_bx1, _by2-_by1
+                        if _bw > _bh * 1.4 and _bw > 60 and _bh > 15:
+                            _fallen.append((_bx1,_by1,_bx2,_by2))
+                if _fallen:
+                    now_fl = time.time()
+                    if (now_fl - st.session_state["last_vlm_call"]) >= 8 and (now_fl - last_fall_scan) >= 8:
+                        st.session_state["last_vlm_call"] = now_fl; last_fall_scan = now_fl
+                        _fb = _fallen[0]
+                        _crop = frame[max(0,_fb[1]-10):_fb[3]+10, max(0,_fb[0]-10):_fb[2]+10]
+                        if _crop.size == 0: _crop = frame
+                        is_fl2, desc = scan_for_fallen_person(_crop)
+                        if is_fl2:
+                            highlight_zone(frame,(_fb[0],_fb[1],_fb[2],_fb[3]),"PERSON FALLEN — ASSISTANCE NEEDED","HIGH")
+                            s=snap(frame); add_event("BEHAVIOR","Person Fallen / Collapsed","HIGH",cam_label,desc or "Person appears to have fallen",s)
+
+            # ── Suspicious package drop heuristic ───────────────────────────
+            # Pre-filter: object appears for the first time near a previous person position,
+            # and that person has now walked >200px away.
+            if mod_behavior_ai and has_ids and result is not None and result.boxes is not None:
+                _live_tids = set()
+                for _b in result.boxes:
+                    _cid2 = int(_b.cls[0])
+                    if _cid2 == PERSON_CLS: continue
+                    if model.names.get(_cid2, "") in THREATS: continue
+                    if _b.id is None or len(_b.id) == 0: continue
+                    _tid2 = int(_b.id[0]); _live_tids.add(_tid2)
+                    _bx1,_by1,_bx2,_by2 = map(int, _b.xyxy[0].tolist())
+                    _ocx,_ocy = (_bx1+_bx2)//2, (_by1+_by2)//2
+                    if _tid2 not in pkg_close_on_drop:
+                        _near_prev = min((((_ocx-px)**2+(_ocy-py)**2)**0.5 for px,py in prev_pcents), default=9999)
+                        pkg_close_on_drop[_tid2] = _near_prev < 150
+                    if pkg_close_on_drop.get(_tid2, False):
+                        _near_now = min((((_ocx-px)**2+(_ocy-py)**2)**0.5 for px,py in pcents), default=9999)
+                        if _near_now > 200:
+                            now_dr = time.time()
+                            if (now_dr - st.session_state["last_vlm_call"]) >= 8 and (now_dr - last_drop_scan) >= 8:
+                                st.session_state["last_vlm_call"] = now_dr; last_drop_scan = now_dr
+                                _crop = frame[max(0,_by1-20):_by2+20, max(0,_bx1-20):_bx2+20]
+                                if _crop.size == 0: _crop = frame
+                                _lbl2 = model.names.get(_cid2, "object")
+                                is_sd, desc = scan_for_package_drop(_crop)
+                                if is_sd:
+                                    highlight_zone(frame,(_bx1,_by1,_bx2,_by2),"SUSPICIOUS PACKAGE DROP","HIGH")
+                                    s=snap(frame); add_event("BEHAVIOR","Suspicious Package Drop","HIGH",cam_label,desc or f"'{_lbl2}' dropped, person walked away",s)
+                                pkg_close_on_drop[_tid2] = False  # fire only once per object
+                pkg_close_on_drop = {k: v for k, v in pkg_close_on_drop.items() if k in _live_tids}
+
+            # ── Unattended child heuristic ────────────────────────────────────
+            # Pre-filter: at least 1 person in frame. Scans every 30s (still consumes shared cooldown).
+            if mod_behavior_ai and person_count >= 1:
+                now_ch = time.time()
+                if (now_ch - st.session_state["last_vlm_call"]) >= 8 and (now_ch - last_child_scan) >= 30:
+                    st.session_state["last_vlm_call"] = now_ch; last_child_scan = now_ch
+                    is_ch, desc = scan_for_unattended_child(frame)
+                    if is_ch:
+                        highlight_zone(frame,(int(W*0.05),HUD,int(W*0.95),H-1),"UNATTENDED CHILD DETECTED","MEDIUM")
+                        s=snap(frame); add_event("BEHAVIOR","Unattended Child","MEDIUM",cam_label,desc or "Child appears to be alone and unattended",s)
+
+            prev_pcents = list(pcents)  # snapshot for next frame's package-drop proximity check
 
             # Triggers
             if mod_restricted:
